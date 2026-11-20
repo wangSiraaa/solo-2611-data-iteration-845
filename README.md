@@ -185,7 +185,6 @@ the file to the fixed contracts.
 ---
 
 ## 3. Ingestion library (`extcontract/ingest.py`)
-
 ```python
 library = IngestionLibrary(reader)                 # fixed reader contract
 res = library.ingest(writer, file_document)        # atomic accept/reject
@@ -265,6 +264,95 @@ No arbitrary type inference, no Arrow Union, no online database migration.
 
 ---
 
+## 4. Ordered-run catalog + archive merge work order (`runs.py`, `workorder.py`)
+
+An independent entry point for the archive sorter. It consumes the *real*
+adapter output (never re-derives it) and produces two independently checkable
+artifacts: a **run catalog** and a **minimum-rewrite merge work order**.
+
+### 4.1 Concatenate real adapter files, keep global positions
+
+```python
+from extcontract import (adapt_rows, concatenate_records, build_run_catalog,
+                         plan_merges, execute_plan, verify_catalog, verify_sorted)
+
+docs = [adapt_rows(w, r, rows_a).records, adapt_rows(w, r, rows_b).records]
+records = concatenate_records(docs)          # rows in exact input order
+catalog = build_run_catalog(records, r, "amount")   # numeric key field
+```
+
+`concatenate_records` stamps each row with a 0-based global `position` and
+keeps the input order; duplicate `row_id`s are rejected (the supplied client
+requires unique ids). The input order is what remembers "original global
+position", so it is preserved through every later merge.
+
+### 4.2 Exact-rational key, nulls last, stable
+
+The key is one **numeric** reader field (a `TEXT` field is rejected). Values
+are compared as exact `fractions.Fraction`, never as text — `-10 < -2` and
+`9 < 10` because they are numbers, not strings. `null` sorts after every
+number. Equal keys are tie-broken by original `position`, so the sort is stable:
+`3, 2a, 2b, 1` merges to `1, 2a, 2b, 3` with `2a` before `2b`.
+
+### 4.3 Natural-run segmentation
+
+From the first unprocessed row: if the next key is *strictly* smaller, take the
+longest strictly decreasing prefix and read it **reversed**; otherwise take the
+longest non-decreasing prefix and read it forward. A trailing single row is its
+own segment. Strictly decreasing may not step across an equal key — that is
+exactly what keeps equal keys in order. Each segment records `start`, `end`,
+`count`, `direction` (`forward`/`reverse`), and a machine-checkable `read`
+instruction. `verify_catalog(records, catalog)` re-derives and checks the runs.
+
+Original input `10,11,12,13,0,1,-4,-3,-10,-9,-8,-7` yields run sizes
+**4, 2, 2, 4**. Changing only `-10 → -2` joins the third run to its
+predecessor: **4, 2, 3, 3**.
+
+### 4.4 Adjacent-only merges, minimum rewrites
+
+`plan_merges(sizes, max_arity)` returns the cheapest schedule where only two or
+three **adjacent** piles merge (adjacency = original run order, *not* key
+order), each merge rewrites every row it touches, and `max_arity ∈ {2, 3}`.
+Empty input or a single run costs 0.
+
+Original input: 2-way minimum **24** rewritten rows, 3-way minimum **16**.
+Modified input (`-10 → -2`): 2-way **24**, 3-way **17**.
+
+The planner does **not** enumerate merge trees (there are exponentially many).
+The interval substructure makes it a DP: the last merge over a range always
+costs that range's row total, so
+
+```
+best[i][j] = W(i,j) + min( pair[i][j], triple[i][j] )
+pair[i][j]   = min over split m   of best[i][m] + best[m+1][j]
+triple[i][j] = min over split b   of pair[i][b] + best[b+1][j]
+```
+
+filled by increasing interval length. `execute_plan` really performs the
+merges with a stable k-way heap merge (tie-break on `position`) and returns
+`records` in `reader-records/v1` form, `executed_steps` (each step's inputs,
+merged row count, and cost — the sum equals the reported cost), and
+`ordered_positions`. `verify_sorted` re-checks the final stream.
+
+Both machines produce the **same** ascending, stable row stream; the supplied
+`reader_client.py` reads it. Run `examples/run_order_demo.py` (and
+`python -m extcontract order WRITER READER VALUES.json KEY --arity 3
+[--catalog OUT] [--sorted OUT]`).
+
+### 4.5 Costs
+
+* **Catalog** (`runs.py`): one scan — `O(m)` time, `O(m + r)` space for the key
+  list and `r` run descriptors (`m` rows, `r` runs). No sort happens here.
+* **Work order** (`workorder.py`): interval DP is `O(r³)` time and `O(r²)`
+  space (the `pair` table is reused so the 3-way term stays cubic, not
+  `O(r⁵)`). At the documented limit of **120 runs** this is ~1.7M inner
+  comparisons; `plan_merges` rejects `> 120` runs with `LimitError` rather than
+  silently degrading.
+* **Execution**: `O(R log k)` per merge step over its `R` output rows for
+  arity `k`; the total rewritten work equals the reported cost by construction.
+
+---
+
 ## Templates for the mandated scenario
 
 `fixtures/bootstrap.json`, `fixtures/F-BAD.json`, `fixtures/F-NEW.json` are the
@@ -288,8 +376,11 @@ extcontract/
   compat.py     row-free whole-domain proof + adaptation plan + witnesses
   adapter.py    per-row validation + plan application -> reader-records/v1
   ingest.py     revision-aware, atomic, idempotent target state
-  cli.py        compat / adapt / ingest commands
+  runs.py       ordered-run catalog over the real adapted stream
+  workorder.py  min-rewrite adjacent merge work order + execution
+  cli.py        compat / adapt / ingest / order commands
 examples/run_745_demo.py   end-to-end scenario against the real client
-fixtures/                  bootstrap, F-BAD, F-NEW documents
-tests/                     compat, adapter, ingest, fixtures, scale
+examples/run_order_demo.py ordered-run catalog + merge work order demo
+fixtures/                  bootstrap, F-BAD, F-NEW, order-values documents
+tests/                     compat, adapter, ingest, fixtures, ordering, scale
 ```

@@ -4,6 +4,8 @@
     python -m extcontract adapt  WRITER.json READER.json INPUT.json OUT.json
     python -m extcontract ingest WRITER.json READER.json FILE.json \
                                    [--state-dir DIR] [--publish OUT.json]
+    python -m extcontract order  WRITER.json READER.json VALUES.json KEY \
+                                   (--arity 2|3) [--catalog OUT.json] [--sorted OUT.json]
 
 ``compat`` prints a human-readable per-column verdict plus the public plan.
 ``adapt`` writes ``reader-records/v1`` (consumable by reader_client.py).
@@ -194,6 +196,56 @@ def _state_from_library(library: IngestionLibrary) -> dict:
     return {"sequence": library._sequence, "rows": rows, "receipts": receipts}
 
 
+def cmd_order(args: argparse.Namespace) -> int:
+    from .adapter import adapt_rows
+    from .runs import build_run_catalog, concatenate_records, verify_catalog
+    from .workorder import execute_plan, plan_merges, verify_sorted
+
+    writer = load_contract(args.writer, role="writer")
+    reader = load_contract(args.reader, role="reader")
+    doc = _load_json(args.values)
+    rows = doc["rows"] if isinstance(doc, dict) else doc
+    adapted = adapt_rows(writer, reader, rows)
+    if adapted.status != "ADAPTED":
+        print(json.dumps(adapted.to_json(), ensure_ascii=False, indent=2, sort_keys=True))
+        print(f"adaptation rejected: {adapted.status}", file=sys.stderr)
+        return 1
+    records = concatenate_records([adapted.records])
+    catalog = build_run_catalog(records, reader, args.key)
+    plan = plan_merges([s.count for s in catalog.segments], args.arity)
+    result = execute_plan(records, catalog, plan)
+    catalog_problems = verify_catalog(records, catalog)
+    sorted_problems = verify_sorted(result.records, catalog)
+    if catalog_problems or sorted_problems:
+        print(
+            json.dumps(
+                {"catalog_problems": catalog_problems, "sorted_problems": sorted_problems},
+                ensure_ascii=False, indent=2,
+            ),
+            file=sys.stderr,
+        )
+        return 1
+    summary = {
+        "segment_row_counts": [s.count for s in catalog.segments],
+        "segments": catalog.to_json()["segments"],
+        "max_arity": args.arity,
+        "feasible": plan.feasible,
+        "total_rewrite_cost": plan.total_cost,
+        "steps": result.executed_steps,
+        "sorted_row_ids": [r["row_id"] for r in result.records["rows"]],
+        "sorted_values": [r["values"][args.key] for r in result.records["rows"]],
+    }
+    if args.catalog:
+        Path(args.catalog).write_text(
+            json.dumps(catalog.to_json(), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    if args.sorted:
+        write_records(result.records, args.sorted)
+    print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="extcontract")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -218,6 +270,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest.add_argument("--state-dir", default=".extcontract-state")
     p_ingest.add_argument("--publish", default=None)
     p_ingest.set_defaults(func=cmd_ingest)
+
+    p_order = sub.add_parser(
+        "order", help="ordered-run catalog + min-rewrite merge work order"
+    )
+    p_order.add_argument("writer")
+    p_order.add_argument("reader")
+    p_order.add_argument("values", help="rows document or bare row list")
+    p_order.add_argument("key", help="numeric reader field used as ascending key")
+    p_order.add_argument("--arity", type=int, choices=(2, 3), required=True)
+    p_order.add_argument("--catalog", default=None)
+    p_order.add_argument("--sorted", default=None)
+    p_order.set_defaults(func=cmd_order)
     return parser
 
 

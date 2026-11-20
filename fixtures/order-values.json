@@ -1,0 +1,16 @@
+{
+  "rows": [
+    {"row_id": "p00", "values": {"amount": 10}},
+    {"row_id": "p01", "values": {"amount": 11}},
+    {"row_id": "p02", "values": {"amount": 12}},
+    {"row_id": "p03", "values": {"amount": 13}},
+    {"row_id": "p04", "values": {"amount": 0}},
+    {"row_id": "p05", "values": {"amount": 1}},
+    {"row_id": "p06", "values": {"amount": -4}},
+    {"row_id": "p07", "values": {"amount": -3}},
+    {"row_id": "p08", "values": {"amount": -10}},
+    {"row_id": "p09", "values": {"amount": -9}},
+    {"row_id": "p10", "values": {"amount": -8}},
+    {"row_id": "p11", "values": {"amount": -7}}
+  ]
+}
